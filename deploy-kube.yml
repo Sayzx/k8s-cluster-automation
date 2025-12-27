@@ -1,0 +1,127 @@
+---
+- name: 1. COMMON CONFIGURATION (All Nodes)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Disable SWAP (Required for K8s)
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Load Kernel Modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+        cat <<EOF > /etc/modules-load.d/k8s.conf
+        overlay
+        br_netfilter
+        EOF
+
+    - name: Configure Sysctl for Networking
+      shell: |
+        cat <<EOF > /etc/sysctl.d/k8s.conf
+        net.bridge.bridge-nf-call-iptables  = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.ipv4.ip_forward                 = 1
+        EOF
+        sysctl --system
+
+    - name: Install System Dependencies
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, containerd, conntrack, socat]
+        state: present
+        update_cache: yes
+
+    - name: Configure Containerd with SystemdCgroup
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+        systemctl restart containerd
+
+    - name: Add Kubernetes APT Key and Repository
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Install K8s Tools (kubelet, kubeadm, kubectl)
+      apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+        update_cache: yes
+
+- name: 2. MASTER INITIALIZATION
+  hosts: master
+  become: yes
+  tasks:
+    - name: Reset kubeadm state
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Initialize Kubernetes Control Plane
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_host }}
+      register: init_res
+
+    - name: Setup Kubeconfig for User
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy admin.conf to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        mode: '0600'
+
+    - name: Install Flannel CNI
+      become: no
+      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Generate Join Command for Workers
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+
+- name: 3. WORKERS JOINING
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Reset worker state and join cluster
+      shell: |
+        kubeadm reset -f
+        {{ hostvars['master-node']['join_cmd'].stdout }}
+
+- name: 4. VERIFICATION & TEST
+  hosts: master
+  tasks:
+    - name: Wait for all nodes to be Ready
+      command: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+    - name: Deploy Nginx Test App (2 replicas)
+      command: kubectl create deployment nginx-test --image=nginx --replicas=2
+
+    - name: Wait for Nginx Pods to be Ready
+      command: kubectl wait --for=condition=Ready pod -l app=nginx-test --timeout=120s
+
+    - name: Check Final Pod Distribution
+      command: kubectl get pods -o wide
+      register: pod_output
+
+    - name: Show Test Report
+      debug:
+        msg: "{{ pod_output.stdout_lines }}"
+
+    - name: Cleanup (Destroy Test Deployment)
+      command: kubectl delete deployment nginx-test
+
+    - name: Export Kubeconfig locally
+      fetch:
+        src: "/home/{{ ansible_user }}/.kube/config"
+        dest: "./k8s-config-export"
+        flat: yes

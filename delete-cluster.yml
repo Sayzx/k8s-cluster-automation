@@ -1,0 +1,35 @@
+---
+- name: UNINSTALL KUBERNETES CLUSTER
+  hosts: all
+  become: yes
+  tasks:
+    - name: Run kubeadm reset
+      command: kubeadm reset -f
+      register: reset_out
+
+    - name: Flush IPTables
+      shell: |
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+        ip6tables -F && ip6tables -t nat -F && ip6tables -t mangle -F && ip6tables -X
+
+    - name: Remove Kubernetes and CNI directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/cni/net.d
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /var/lib/dockershim
+        - /var/run/kubernetes
+        - /home/{{ ansible_user }}/.kube
+
+    - name: Restart Containerd to clear namespaces
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Display cleanup status
+      debug:
+        msg: "Cluster has been successfully removed from {{ inventory_hostname }}"
