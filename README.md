@@ -186,7 +186,7 @@ worker2 | SUCCESS => {"ping": "pong"}
 Run the main deployment playbook:
 
 ```bash
-ansible-playbook -i hosts.ini deploy-kube.yml
+ansible-playbook -i hosts.ini deploy-kube.yml --ask-become-pass
 ```
 
 **What happens:**
